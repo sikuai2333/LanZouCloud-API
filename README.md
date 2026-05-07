@@ -64,6 +64,172 @@ if code == LanZouCloud.SUCCESS:
     print(files)
 ```
 
+# 功能总览
+
+以下函数均来自 `from lanzou.api import LanZouCloud` 的 `LanZouCloud` 实例，按当前仓库实现分组整理。
+
+## 1. 会话与限制控制
+
+- `ignore_limits()`：忽略蓝奏官方对上传格式和大小的默认限制，用于大文件和受限后缀上传
+- `set_max_size(max_size=100)`：设置单文件大小上限，配合 `ignore_limits()` 使用
+- `set_upload_delay(t_range)`：设置大文件分片上传延时区间，降低风控概率
+- `login(username, passwd)`：用户名密码登录
+- `get_cookie()`：导出当前会话 Cookie，便于持久化保存或二次登录
+- `login_by_cookie(cookie)`：使用 Cookie 登录
+- `logout()`：注销当前账号
+
+## 2. 文件与文件夹列表
+
+- `get_file_list(folder_id=-1)`：获取指定目录下的文件列表
+- `get_dir_list(folder_id=-1)`：获取指定目录下的文件夹列表
+- `get_full_path(folder_id=-1)`：获取指定目录的完整路径
+- `clean_ghost_folders()`：清理蓝奏控制台中可移动但不可见的“幽灵文件夹”
+
+## 3. 分享、直链与信息解析
+
+- `get_file_info_by_url(share_url, pwd='')`：通过分享链接获取文件信息
+- `get_file_info_by_id(file_id)`：通过控制台文件 ID 获取文件信息
+- `get_durl_by_url(share_url, pwd='')`：通过分享链接获取文件直链
+- `get_durl_by_id(file_id)`：通过控制台文件 ID 获取文件直链
+- `get_share_info(fid, is_file=True)`：获取文件或文件夹当前分享信息
+- `get_folder_info_by_url(share_url, dir_pwd='')`：通过分享链接获取文件夹及其下级内容
+- `get_folder_info_by_id(folder_id)`：通过文件夹 ID 获取文件夹及其下级内容
+
+## 4. 上传与下载
+
+- `upload_file(file_path, folder_id=-1, *, callback=None, uploaded_handler=None)`：上传单个文件，小文件与大文件统一入口
+- `upload_dir(dir_path, folder_id=-1, *, callback=None, failed_callback=None, uploaded_handler=None)`：批量上传目录中的文件
+- `down_file_by_url(share_url, pwd='', save_path='./Download', *, callback=None, overwrite=False, downloaded_handler=None)`：通过分享链接下载文件
+- `down_file_by_id(fid, save_path='./Download', *, callback=None, overwrite=False, downloaded_handler=None)`：通过文件 ID 下载文件
+- `down_dir_by_url(share_url, dir_pwd='', save_path='./Download', *, callback=None, mkdir=True, overwrite=False, recursive=False, failed_callback=None, downloaded_handler=None)`：通过分享链接下载文件夹，支持递归下载子文件夹
+- `down_dir_by_id(folder_id, save_path='./Download', *, callback=None, mkdir=True, overwrite=False, failed_callback=None, downloaded_handler=None, recursive=False)`：通过文件夹 ID 下载文件夹，支持递归下载子文件夹
+
+## 5. 文件夹管理与属性修改
+
+- `mkdir(parent_id, folder_name, desc='')`：创建文件夹
+- `rename_dir(folder_id, folder_name)`：重命名文件夹
+- `set_desc(fid, desc, is_file=True)`：设置文件或文件夹描述
+- `set_passwd(fid, passwd='', is_file=True)`：设置或清除文件/文件夹提取码
+- `rename_file(file_id, filename)`：重命名文件。当前蓝奏服务端实测该能力受会员限制，非会员账号通常返回 `FAILED`
+
+## 6. 移动能力
+
+- `get_move_folders()`：获取可移动目标文件夹列表
+- `get_move_paths()`：获取全部文件夹的绝对路径列表
+- `move_file(file_id, folder_id=-1)`：移动文件到目标文件夹
+- `move_folder(folder_id, parent_folder_id=-1)`：移动文件夹到目标父目录
+
+## 7. 删除、回收站与恢复
+
+- `delete(fid, is_file=True)`：删除文件或文件夹到回收站
+- `clean_rec()`：清空回收站
+- `get_rec_dir_list()`：获取回收站文件夹列表
+- `get_rec_file_list(folder_id=-1)`：获取回收站文件列表
+- `get_rec_all()`：获取整理后的回收站全部内容
+- `delete_rec(fid, is_file=True)`：彻底删除回收站中的文件或文件夹
+- `delete_rec_multi(*, files=None, folders=None)`：批量彻底删除回收站内容
+- `recovery(fid, is_file=True)`：恢复单个文件或文件夹
+- `recovery_multi(*, files=None, folders=None)`：批量恢复文件或文件夹
+- `recovery_all()`：恢复回收站全部内容
+
+## 8. 回调支持
+
+- 上传与下载相关函数普遍支持 `callback`，用于上报进度
+- `upload_file()`、`upload_dir()` 支持 `uploaded_handler`
+- `down_file_by_url()`、`down_file_by_id()`、`down_dir_by_url()`、`down_dir_by_id()` 支持 `downloaded_handler`
+- 批量上传和递归下载相关流程支持 `failed_callback` 处理失败项
+
+## 9. 常见调用示例
+
+### 用户名密码登录
+
+```python
+from lanzou.api import LanZouCloud
+
+client = LanZouCloud()
+client.login("username", "password")
+```
+
+### Cookie 登录
+
+```python
+from lanzou.api import LanZouCloud
+
+client = LanZouCloud()
+client.login_by_cookie({"ylogin": "...", "phpdisk_info": "..."})
+```
+
+### 获取根目录文件和文件夹
+
+```python
+files = client.get_file_list(-1)
+folders = client.get_dir_list(-1)
+```
+
+### 创建文件夹并上传文件
+
+```python
+client.mkdir(-1, "Codex-Test", "test folder")
+dirs = client.get_dir_list(-1)
+target = dirs.find_by_name("Codex-Test")[0]
+client.upload_file("example.txt", folder_id=target.id)
+```
+
+### 获取分享信息和直链
+
+```python
+share = client.get_share_info(123456, is_file=True)
+detail = client.get_file_info_by_url("https://example.lanzou.com/abcd", pwd="1234")
+direct = client.get_durl_by_url("https://example.lanzou.com/abcd", pwd="1234")
+```
+
+### 下载文件和文件夹
+
+```python
+client.down_file_by_id(123456, save_path="./Download")
+client.down_dir_by_id(654321, save_path="./Download", recursive=True)
+```
+
+### 修改描述、提取码、目录名
+
+```python
+client.set_desc(123456, "new desc", is_file=True)
+client.set_passwd(123456, "9abc", is_file=True)
+client.rename_dir(654321, "Renamed-Folder")
+```
+
+### 移动文件和文件夹
+
+```python
+client.move_file(123456, folder_id=654321)
+client.move_folder(654321, parent_folder_id=-1)
+```
+
+### 删除、恢复与清空回收站
+
+```python
+client.delete(123456, is_file=True)
+client.recovery(123456, is_file=True)
+client.clean_rec()
+```
+
+### 上传大文件
+
+```python
+client.ignore_limits()
+client.set_max_size(100)
+client.set_upload_delay((0.8, 1.6))
+client.upload_file("big-file.bin", folder_id=-1)
+```
+
+## 10. 实际行为说明
+
+- `login(username, passwd)` 与 `login_by_cookie(cookie)` 已按当前网页流程修复并实测可用
+- 大文件路径已实测可用：配合 `ignore_limits()` 与 `set_max_size()` 可以上传并重组下载超过官方默认限制的文件
+- `recovery()` / `recovery_multi()` 的恢复位置由蓝奏服务端决定，当前实测通常恢复到根目录
+- 删除包含子文件夹的文件夹时，蓝奏服务端可能拒绝执行
+- 回收站列表在删除、恢复、彻底删除后可能存在短时刷新延迟
+
 # 作为 Adapter 层使用
 
 - 本库适合作为蓝奏云协议适配层、任务执行层或网页后端的底层 SDK
