@@ -35,8 +35,10 @@ def remove_notes(html: str) -> str:
     """删除网页的注释"""
     # 去掉 html 里面的 // 和 <!-- --> 注释，防止干扰正则匹配提取数据
     # 蓝奏云的前端程序员喜欢改完代码就把原来的代码注释掉,就直接推到生产环境了 =_=
-    html = re.sub(r'<!--.+?-->|\s+//\s*.+', '', html)  # html 注释
-    html = re.sub(r'(.+?[,;])\s*//.+', r'\1', html)  # js 注释
+    html = re.sub(r'/\*.*?\*/', '', html, flags=re.S)  # js block 注释
+    html = re.sub(r'<!--.*?-->', '', html, flags=re.S)  # html 注释
+    html = re.sub(r'(^|[\r\n])[ \t]*//[^\r\n]*', r'\1', html, flags=re.M)  # 独占一行的 js 注释
+    html = re.sub(r'([,;])\s*//[^\r\n]*', r'\1', html)  # 行尾 js 注释
     return html
 
 

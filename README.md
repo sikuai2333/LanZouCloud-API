@@ -31,8 +31,66 @@
 - `dev` 分支用于修复错误，待稳定后再推到 `master` 分支
 - `master` 分支将自动发布到 PyPI，使用 `pip install lanzou-api` 即可安装
 - API 文档请查看 [wiki](https://github.com/zaxtyson/LanZouCloud-API/wiki) 页面
+- 从 `v2.6.11` 开始，增量发布说明同时记录在 [CHANGELOG.md](CHANGELOG.md)
+
+# 当前状态
+
+- 已恢复当前蓝奏网页登录流程，`login(username, password)` 与 `login_by_cookie(cookie)` 均已实测可用
+- 已修复当前网页结构下的分享文件、带提取码分享文件、分享文件夹、直链解析、控制台列表、路径枚举与回收站相关接口
+- `rename_file()` 仍受蓝奏云服务端会员能力限制。当前非会员账号实测服务端返回 `此功能仅会员使用，请先开通会员`，本库返回 `FAILED`
+- 大文件路径已实测可用：在 `ignore_limits()` + `set_max_size(100)` 条件下，101 MiB 文件可成功分片上传，并可通过目录下载完整重组，下载结果与原文件 MD5 一致
+
+# 安装
+
+```bash
+pip install lanzou-api
+```
+
+或在本地仓库中安装：
+
+```bash
+pip install .
+```
+
+# 快速开始
+
+```python
+from lanzou.api import LanZouCloud
+
+client = LanZouCloud()
+code = client.login("username", "password")
+if code == LanZouCloud.SUCCESS:
+    files = client.get_file_list(-1)
+    print(files)
+```
+
+# 作为 Adapter 层使用
+
+- 本库适合作为蓝奏云协议适配层、任务执行层或网页后端的底层 SDK
+- 一个 `LanZouCloud()` 实例对应一个独立会话，内部持有自己的 `requests.Session`、Cookie 与控制台上下文
+- **不要在多个账号之间复用同一个实例**
+- **不要让多个并发请求同时操作同一个实例**，推荐做法是“每账号一个实例 + 每账号互斥锁”
+- 上传和下载接口当前基于本地文件路径设计，网页端通常需要先把上传文件落到临时目录，再调用本库
+- 大文件上传/下载与批量操作更适合作为后台任务执行，而不是直接挂在单个 HTTP 请求里长时间阻塞
+- 本库返回值主要仍以错误码为主。如果要给前端使用，建议在你的服务层把错误码、异常和任务状态统一转换成 JSON 响应模型
+
+# 已知限制
+
+- `rename_file()` 受蓝奏会员能力限制，非会员账号会返回 `FAILED`
+- 部分回收站接口存在蓝奏网页端的短时抖动，服务端状态变化后可能需要短轮询
+- `recovery()` / `recovery_multi()` 的真实行为由蓝奏服务端决定，当前实测恢复后会回到根目录而不是原目录
+- 删除含子文件夹的文件夹时，蓝奏服务端可能拒绝直接删除
 
 # 更新日志
+
+## `v2.6.11`
+
+- 重建当前蓝奏网页登录流程，恢复 `login()` 用户名密码登录，并保留 `login_by_cookie()` 作为稳定登录路径
+- 统一请求层，修复当前站点下的域名切换、Referer / Origin、Cookie 验证与分享页 AJAX 派生逻辑
+- 修复分享文件、带提取码分享文件、分享文件夹、直链、控制台文件列表、`get_full_path()`、`get_move_folders()`、`get_move_paths()`、回收站与批量回收相关接口
+- 新增单元测试与 live 测试，已覆盖登录、上传下载、分享解析、移动、回收站、`upload_dir()`、`logout()` 等主要流程
+- 明确 `rename_file()` 的真实行为：该接口受蓝奏会员能力限制，当前非会员账号实测服务端返回 `此功能仅会员使用，请先开通会员`，本库返回 `FAILED`
+- 已实测在 `ignore_limits()` + `set_max_size(100)` 条件下，101 MiB 文件可成功分片上传，并可通过 `down_dir_by_id()` 完整重组下载，MD5 一致
 
 ## `v2.6.10`
 

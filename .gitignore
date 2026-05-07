@@ -1,9 +1,28 @@
 # Byte-compiled / optimized
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 # Pycharm
 .idea/
 
 # Environment
 venv/
+.venv/
+.env
+.env.*
+!.env.example
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Local live-test and capture artifacts
+*.har
+*.cookies.txt
+accounts_login*.html
+.live/
+live_test_downloads/
+live_test_workspace/
+tmp_live_downloads/

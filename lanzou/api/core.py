@@ -17,6 +17,28 @@ from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 from urllib3 import disable_warnings
 from urllib3.exceptions import InsecureRequestWarning
 
+from lanzou.api._internal.auth import (
+    LOGIN_PAGE_URL,
+    LOGOUT_URL,
+    looks_logged_in,
+    login_with_password,
+    parse_cookie_input,
+    verify_cookie_login,
+)
+from lanzou.api._internal.console import parse_console_dynamic_values
+from lanzou.api._internal.http import (
+    LanZouHTTPClient,
+    build_browser_headers,
+    expand_lanzou_urls,
+    join_share_url,
+)
+from lanzou.api._internal.parsers import (
+    parse_file_page_context,
+    parse_folder_page_context,
+    parse_password_share_ajax,
+    resolve_iframe_url,
+    resolve_sign_from_iframe,
+)
 from lanzou.api.models import FileList, FolderList
 from lanzou.api.types import *
 from lanzou.api.utils import *
@@ -45,9 +67,9 @@ class LanZouCloud(object):
         self._timeout = 15  # 每个请求的超时(不包含下载响应体的用时)
         self._max_size = 100  # 单个文件大小上限 MB
         self._upload_delay = (0, 0)  # 文件上传延时
-        self._host_url = 'https://pan.lanzouo.com'
+        self._host_url = 'https://lanzoux.com'
         self._doupload_url = 'https://pc.woozooo.com/doupload.php'
-        self._account_url = 'https://pc.woozooo.com/account.php'
+        self._account_url = LOGIN_PAGE_URL
         self._mydisk_url = 'https://pc.woozooo.com/mydisk.php'
         self._cookies = None
         self._headers = {
@@ -55,40 +77,59 @@ class LanZouCloud(object):
             'Referer': 'https://pc.woozooo.com/mydisk.php',
             'Accept-Language': 'zh-CN,zh;q=0.9',  # 提取直连必需设置这个，否则拿不到数据
         }
-        self._uid = 0 # uid 用于上传文件时的参数
+        self._uid = 0  # uid 用于上传文件时的参数
+        self._console_values = {}
+        self._http = LanZouHTTPClient(self._session, self._headers, timeout=self._timeout)
         disable_warnings(InsecureRequestWarning)  # 全局禁用 SSL 警告
 
     def _get(self, url, **kwargs):
-        for possible_url in self._all_possible_urls(url):
-            try:
-                kwargs.setdefault('timeout', self._timeout)
-                kwargs.setdefault('headers', self._headers)
-                return self._session.get(possible_url, verify=False, **kwargs)
-            except (ConnectionError, requests.RequestException):
-                logger.debug(f"Get {possible_url} failed, try another domain")
-
-        return None
+        return self._http.get(url, **kwargs)
 
     def _post(self, url, data, **kwargs):
-        for possible_url in self._all_possible_urls(url):
-            try:
-                kwargs.setdefault('timeout', self._timeout)
-                kwargs.setdefault('headers', self._headers)
-                return self._session.post(possible_url, data, verify=False, **kwargs)
-            except (ConnectionError, requests.RequestException):
-                logger.debug(f"Post to {possible_url} ({data}) failed, try another domain")
+        return self._http.post(url, data, **kwargs)
 
-        return None
+    def _stream_download(self, url, file_handle, *, start_byte=0, callback=None,
+                         total_size=None, file_name=None, max_retries=5):
+        """带 Range 续传和短重试的流式下载。"""
+        downloaded = start_byte
+        attempts = 0
+        while True:
+            headers = dict(self._headers)
+            if downloaded > 0:
+                headers['Range'] = f'bytes={downloaded}-'
+            resp = self._get(url, stream=True, headers=headers)
+            if resp is None:
+                attempts += 1
+                if attempts > max_retries:
+                    return False, downloaded
+                continue
+            if resp.status_code == 416:
+                return True, downloaded
+            try:
+                for chunk in resp.iter_content(4096):
+                    if not chunk:
+                        continue
+                    file_handle.write(chunk)
+                    file_handle.flush()
+                    downloaded += len(chunk)
+                    if callback is not None and total_size is not None and file_name is not None:
+                        callback(file_name, total_size, downloaded)
+                return True, downloaded
+            except requests.RequestException as exc:
+                attempts += 1
+                logger.warning(f"Download interrupted at byte {downloaded}, retry {attempts}/{max_retries}: {exc}")
+                if attempts > max_retries:
+                    return False, downloaded
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _all_possible_urls(url: str) -> List[str]:
         """蓝奏云的主域名有时会挂掉, 此时尝试切换到备用域名"""
-        available_domains = [
-            'lanzouw.com',  # 鲁ICP备15001327号-7, 2021-09-02
-            'lanzoui.com',  # 鲁ICP备15001327号-6, 2020-06-09
-            'lanzoux.com'  # 鲁ICP备15001327号-5, 2020-06-09
-        ]
-        return [url.replace('lanzouo.com', d) for d in available_domains]
+        return expand_lanzou_urls(url)
 
     def ignore_limits(self):
         """解除官方限制"""
@@ -111,49 +152,95 @@ class LanZouCloud(object):
         return LanZouCloud.FAILED
 
     def login(self, username, passwd) -> int:
-        """
-        登录蓝奏云控制台[已弃用]
-        对某些用户可能有用
-        """
-        login_data = {"task": "3", "setSessionId": "", "setToken": "", "setSig": "",
-                      "setScene": "", "uid": username, "pwd": passwd}
-        phone_header = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/82.0.4051.0 Mobile Safari/537.36"}
-        html = self._get(self._account_url)
-        if not html:
+        """登录蓝奏云控制台。"""
+        result = login_with_password(self._http, username, passwd)
+        if not result:
             return LanZouCloud.NETWORK_ERROR
-        formhash = re.findall(r'name="formhash" value="(.+?)"', html.text)
-        if not formhash:
-            return LanZouCloud.FAILED
-        login_data['formhash'] = formhash[0]
-        html = self._post(self._mydisk_url, login_data, headers=phone_header)
-        if not html:
-            return LanZouCloud.NETWORK_ERROR
-        try:
-            if '成功' in html.json()['info']:
-                self._cookies = html.cookies.get_dict()
-                return LanZouCloud.SUCCESS
-            else:
+
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], dict):
+            payload, verify_resp = result
+            if not verify_resp or not looks_logged_in(verify_resp.text):
                 return LanZouCloud.FAILED
-        except ValueError:
+            cookies = self._session.cookies.get_dict()
+            self._cookies = cookies
+            try:
+                self._uid = int(cookies.get("ylogin", 0))
+            except (TypeError, ValueError):
+                self._uid = 0
+            self._refresh_console_context()
+            return LanZouCloud.SUCCESS
+
+        payload = result
+        if payload.get("msgs") == "密码不正确":
+            return LanZouCloud.PASSWORD_ERROR
+        if payload.get("msgs") == "用户名不正确":
+            return LanZouCloud.ID_ERROR
+        if str(payload.get("zt")) == "0":
             return LanZouCloud.FAILED
+        return LanZouCloud.SUCCESS
 
     def get_cookie(self) -> dict:
         """获取用户 Cookie"""
         return self._cookies
 
+    def _refresh_console_context(self):
+        page = self._get(
+            self._mydisk_url + '?item=files&action=index',
+            headers=build_browser_headers(self._headers, referer='https://pc.woozooo.com/mydisk.php'),
+        )
+        if not page:
+            return {}
+        values = parse_console_dynamic_values(page.text)
+        self._console_values.update(values)
+        if not self._uid and values.get("uid"):
+            try:
+                self._uid = int(values["uid"])
+            except (TypeError, ValueError):
+                pass
+        return self._console_values
+
+    def _console_request_data(self, **extra):
+        values = self._console_values or self._refresh_console_context()
+        data = {}
+        if values.get("vei"):
+            data["vei"] = values["vei"]
+        data.update(extra)
+        return data
+
+    def _console_ajax_headers(self):
+        return build_browser_headers(
+            self._headers,
+            referer='https://pc.woozooo.com/mydisk.php?item=files&action=index',
+            origin='https://pc.woozooo.com',
+            extra={
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'same-origin',
+            },
+        )
+
     def login_by_cookie(self, cookie: dict) -> int:
         """通过cookie登录"""
-        self._uid = cookie['ylogin'] # 将cookie的uid保存下来用于上传函数
-        self._session.cookies.update(cookie)
-        html = self._get(self._account_url)
-        if not html:
+        cookie_dict = parse_cookie_input(cookie)
+        if "ylogin" in cookie_dict:
+            try:
+                self._uid = int(cookie_dict["ylogin"])
+            except (TypeError, ValueError):
+                self._uid = 0
+        ok, verify_resp = verify_cookie_login(self._http, cookie_dict)
+        if not verify_resp:
             return LanZouCloud.NETWORK_ERROR
-        return LanZouCloud.FAILED if '网盘用户登录' in html.text else LanZouCloud.SUCCESS
+        if not ok:
+            return LanZouCloud.FAILED
+        self._cookies = self._session.cookies.get_dict()
+        self._refresh_console_context()
+        return LanZouCloud.SUCCESS
 
     def logout(self) -> int:
         """注销"""
-        html = self._get(self._account_url, params={'action': 'logout'})
+        html = self._get(LOGOUT_URL)
         if not html:
             return LanZouCloud.NETWORK_ERROR
         return LanZouCloud.SUCCESS if '退出系统成功' in html.text else LanZouCloud.FAILED
@@ -253,7 +340,14 @@ class LanZouCloud(object):
         """获取整理后回收站的所有信息"""
         root_files = self.get_rec_file_list()  # 回收站根目录文件列表
         folder_list = FolderList()  # 保存整理后的文件夹列表
-        for folder in self.get_rec_dir_list():  # 遍历所有子文件夹
+        folders_by_id = {}
+        for attempt in range(5):
+            for folder in self.get_rec_dir_list():  # 遍历所有子文件夹
+                folders_by_id.setdefault(folder.id, folder)
+            if attempt < 4:
+                sleep(0.4)
+
+        for folder in folders_by_id.values():
             this_folder = RecFolder(folder.name, folder.id, folder.size, folder.time, FileList())
             for file in self.get_rec_file_list(folder.id):  # 文件夹内的文件属性: name,id,type,size
                 if root_files.find_by_id(file.id):  # 根目录存在同名文件
@@ -362,8 +456,8 @@ class LanZouCloud(object):
         page = 1
         file_list = FileList()
         while True:
-            post_data = {'task': 5, 'folder_id': folder_id, 'pg': page}
-            resp = self._post(self._doupload_url, post_data)
+            post_data = self._console_request_data(task=5, folder_id=folder_id, pg=page)
+            resp = self._post(self._doupload_url, post_data, headers=self._console_ajax_headers())
             if not resp:  # 网络异常，重试
                 continue
             else:
@@ -389,8 +483,12 @@ class LanZouCloud(object):
     def get_dir_list(self, folder_id=-1) -> FolderList:
         """获取子文件夹列表"""
         folder_list = FolderList()
-        post_data = {'task': 47, 'folder_id': folder_id}
-        resp = self._post(self._doupload_url+"?uid="+str(self._uid), post_data) # 上传文件时需要 uid 参数
+        post_data = self._console_request_data(task=47, folder_id=folder_id)
+        resp = self._post(
+            self._doupload_url+"?uid="+str(self._uid),
+            post_data,
+            headers=self._console_ajax_headers(),
+        ) # 上传文件时需要 uid 参数
         if not resp:
             return folder_list
         for folder in resp.json()['text']:
@@ -430,11 +528,19 @@ class LanZouCloud(object):
         """获取文件夹完整路径"""
         path_list = FolderList()
         path_list.append(FolderId('LanZouCloud', -1))
-        post_data = {'task': 47, 'folder_id': folder_id}
-        resp = self._post(self._doupload_url, post_data)
+        post_data = self._console_request_data(task=47, folder_id=folder_id)
+        resp = self._post(
+            self._doupload_url + "?uid=" + str(self._uid),
+            post_data,
+            headers=self._console_ajax_headers(),
+        )
         if not resp:
             return path_list
-        for folder in resp.json()['info']:
+        try:
+            info = resp.json().get('info') or []
+        except ValueError:
+            return path_list
+        for folder in info:
             if folder['folderid'] and folder['name']:  # 有时会返回无效数据, 这两个字段中某个为 None
                 path_list.append(FolderId(id=int(folder['folderid']), name=folder['name']))
         return path_list
@@ -447,34 +553,38 @@ class LanZouCloud(object):
         if not is_file_url(share_url):  # 非文件链接返回错误
             return FileDetail(LanZouCloud.URL_INVALID, pwd=pwd, url=share_url)
 
-        first_page = self._get(share_url)  # 文件分享页面(第一页)
+        first_page = self._get(share_url, allow_acw_retry=True)  # 文件分享页面(第一页)
         if not first_page:
             return FileDetail(LanZouCloud.NETWORK_ERROR, pwd=pwd, url=share_url)
-
-        if "acw_sc__v2" in first_page.text:
-            # 在页面被过多访问或其他情况下，有时候会先返回一个加密的页面，其执行计算出一个acw_sc__v2后放入页面后再重新访问页面才能获得正常页面
-            # 若该页面进行了js加密，则进行解密，计算acw_sc__v2，并加入cookie
-            acw_sc__v2 = calc_acw_sc__v2(first_page.text)
-            self._session.cookies.set("acw_sc__v2", acw_sc__v2)
-            logger.debug(f"Set Cookie: acw_sc__v2={acw_sc__v2}")
-            first_page = self._get(share_url)  # 文件分享页面(第一页)
-            if not first_page:
-                return FileDetail(LanZouCloud.NETWORK_ERROR, pwd=pwd, url=share_url)
-
-        first_page = remove_notes(first_page.text)  # 去除网页里的注释
-        if '文件取消' in first_page or '文件不存在' in first_page:
+        page_context = parse_file_page_context(first_page.text, share_url, first_page.url)
+        first_page_html = page_context["html"]
+        if '文件取消' in first_page_html or '文件不存在' in first_page_html:
             return FileDetail(LanZouCloud.FILE_CANCELLED, pwd=pwd, url=share_url)
 
         # 这里获取下载直链 304 重定向前的链接
         try:
-            if 'id="pwdload"' in first_page or 'id="passwddiv"' in first_page:  # 文件设置了提取码时
+            if 'id="pwdload"' in first_page_html or 'id="passwddiv"' in first_page_html:  # 文件设置了提取码时
                 if len(pwd) == 0:
                     return FileDetail(LanZouCloud.LACK_PASSWORD, pwd=pwd, url=share_url)  # 没给提取码直接退出
-                # data : 'action=downprocess&sign=AGZRbwEwU2IEDQU6BDRUaFc8DzxfMlRjCjTPlVkWzFSYFY7ATpWYw_c_c&p='+pwd,
-                sign = re.search(r"sign=(\w+?)&", first_page).group(1)
+                ajax_info = parse_password_share_ajax(first_page_html)
+                ajax_url = page_context["ajax_url"]
+                if ajax_info["ajax_path"]:
+                    ajax_url = join_share_url(page_context["origin"] + "/", ajax_info["ajax_path"].lstrip("/"))
+                sign = ajax_info["sign"]
+                if not sign:
+                    sign_match = re.search(r"sign=(\w+?)&", first_page_html)
+                    sign = sign_match.group(1)
                 post_data = {'action': 'downprocess', 'sign': sign, 'p': pwd}
-                link_info = self._post(self._host_url + '/ajaxm.php', post_data)  # 保存了重定向前的链接信息和文件名
-                second_page = self._get(share_url)  # 再次请求文件分享页面，可以看见文件名，时间，大小等信息(第二页)
+                if ajax_info["kd"]:
+                    post_data['kd'] = ajax_info["kd"]
+                ajax_headers = build_browser_headers(
+                    self._headers,
+                    referer=page_context["referer"],
+                    origin=page_context["origin"],
+                    extra={"X-Requested-With": "XMLHttpRequest"},
+                )
+                link_info = self._post(ajax_url, post_data, headers=ajax_headers)
+                second_page = self._get(share_url, allow_acw_retry=True)  # 再次请求文件分享页面，可以看见文件名，时间，大小等信息(第二页)
                 if not link_info or not second_page.text:
                     return FileDetail(LanZouCloud.NETWORK_ERROR, pwd=pwd, url=share_url)
                 link_info = link_info.json()
@@ -488,43 +598,66 @@ class LanZouCloud(object):
                 f_desc = re.search(r'class="n_box_des">(.*?)</div>', second_page)
                 f_desc = f_desc.group(1) if f_desc else ''
             else:  # 文件没有设置提取码时,文件信息都暴露在分享页面上
-                para = re.search(r'<iframe.*?src="(.+?)"', first_page).group(1)  # 提取下载页面 URL 的参数
+                para = re.search(r'<iframe.*?src="(.+?)"', first_page_html).group(1)  # 提取下载页面 URL 的参数
                 # 文件名位置变化很多
-                f_name = re.search(r"<title>(.+?) - 蓝奏云</title>", first_page) or \
-                         re.search(r'<div class="filethetext".+?>([^<>]+?)</div>', first_page) or \
-                         re.search(r'<div style="font-size.+?>([^<>].+?)</div>', first_page) or \
-                         re.search(r"var filename = '(.+?)';", first_page) or \
-                         re.search(r'id="filenajax">(.+?)</div>', first_page) or \
-                         re.search(r'<div class="b"><span>([^<>]+?)</span></div>', first_page)
+                f_name = re.search(r"<title>(.+?) - 蓝奏云</title>", first_page_html) or \
+                         re.search(r'<div class="filethetext".+?>([^<>]+?)</div>', first_page_html) or \
+                         re.search(r'<div style="font-size.+?>([^<>].+?)</div>', first_page_html) or \
+                         re.search(r"var filename = '(.+?)';", first_page_html) or \
+                         re.search(r'id="filenajax">(.+?)</div>', first_page_html) or \
+                         re.search(r'<div class="b"><span>([^<>]+?)</span></div>', first_page_html)
                 f_name = f_name.group(1).replace("*", "_") if f_name else "未匹配到文件名"
                 # 匹配文件时间，文件没有时间信息就视为今天，统一表示为 2020-01-01 格式
-                f_time = re.search(r'>(\d+\s?[秒天分小][钟时]?前|[昨前]天\s?[\d:]+?|\d+\s?天前|\d{4}-\d\d-\d\d)<', first_page)
+                f_time = re.search(r'>(\d+\s?[秒天分小][钟时]?前|[昨前]天\s?[\d:]+?|\d+\s?天前|\d{4}-\d\d-\d\d)<', first_page_html)
                 f_time = time_format(f_time.group(1)) if f_time else time_format('0 小时前')
                 # 匹配文件大小
-                f_size = re.search(r'大小.+?(\d[\d.,]+\s?[BKM]?)<', first_page)
+                f_size = re.search(r'大小.+?(\d[\d.,]+\s?[BKM]?)<', first_page_html)
                 f_size = f_size.group(1).replace(",", "") if f_size else '0 M'
-                f_desc = re.search(r'文件描述.+?<br>\n?\s*(.*?)\s*</td>', first_page)
+                f_desc = re.search(r'文件描述.+?<br>\n?\s*(.*?)\s*</td>', first_page_html)
                 f_desc = f_desc.group(1) if f_desc else ''
-                first_page = self._get(self._host_url + para)
-                if not first_page:
+                frame_url = resolve_iframe_url(page_context, para)
+                frame_page = self._get(
+                    frame_url,
+                    headers=build_browser_headers(self._headers, referer=page_context["referer"]),
+                    allow_acw_retry=True,
+                )
+                if not frame_page:
                     return FileDetail(LanZouCloud.NETWORK_ERROR, name=f_name, time=f_time, size=f_size, desc=f_desc,
                                       pwd=pwd, url=share_url)
-                first_page = remove_notes(first_page.text)
+                frame_html = remove_notes(frame_page.text)
                 # 一般情况 sign 的值就在 data 里，有时放在变量后面
-                sign = re.search(r"'sign':(.+?),", first_page).group(1)
-                if len(sign) < 20:  # 此时 sign 保存在变量里面, 变量名是 sign 匹配的字符
-                    sign = re.search(rf"var {sign}\s*=\s*'(.+?)';", first_page).group(1)
+                sign = resolve_sign_from_iframe(frame_html)
                 post_data = {'action': 'downprocess', 'sign': sign, 'ves': 1}
+                ajax_url = page_context["ajax_url"]
                 # 某些特殊情况 share_url 会出现 webpage 参数, post_data 需要更多参数
                 # https://github.com/zaxtyson/LanZouCloud-API/issues/74
                 # https://github.com/zaxtyson/LanZouCloud-API/issues/81
-                if "?webpage=" in share_url:
-                    ajax_data = re.search(r"var ajaxdata\s*=\s*'(.+?)';", first_page).group(1)
-                    web_sign = re.search(r"var a?websigna?\s*=\s*'(.+?)';", first_page).group(1)
-                    web_sign_key = re.search(r"var c?websignkeyc?\s*=\s*'(.+?)';", first_page).group(1)
-                    post_data = {'action': 'downprocess', 'signs': ajax_data, 'sign': sign, 'ves': 1,
-                                 'websign': web_sign, 'websignkey': web_sign_key}
-                link_info = self._post(self._host_url + '/ajaxm.php', post_data)
+                ajax_data_match = re.search(r"var ajaxdata\s*=\s*'(.+?)';", frame_html)
+                if ajax_data_match:
+                    ajax_data = ajax_data_match.group(1)
+                    web_sign_match = re.search(r"var a?websigna?\s*=\s*'(.+?)';", frame_html)
+                    web_sign_key_match = re.search(r"var c?websignkeyc?\s*=\s*'(.+?)';", frame_html)
+                    kd_match = re.search(r"var kdns\s*=\s*(\d+);", frame_html)
+                    file_query_match = re.search(r"url\s*:\s*'/ajaxm\.php\?file=(\d+)'", frame_html)
+                    post_data = {
+                        'action': 'downprocess',
+                        'sign': sign,
+                        'signs': ajax_data,
+                        'ves': 1,
+                        'websign': web_sign_match.group(1) if web_sign_match else '',
+                        'websignkey': web_sign_key_match.group(1) if web_sign_key_match else ajax_data,
+                    }
+                    if kd_match:
+                        post_data['kd'] = kd_match.group(1)
+                    if file_query_match:
+                        ajax_url = join_share_url(page_context["origin"] + "/", f'ajaxm.php?file={file_query_match.group(1)}')
+                ajax_headers = build_browser_headers(
+                    self._headers,
+                    referer=frame_page.url,
+                    origin=page_context["origin"],
+                    extra={"X-Requested-With": "XMLHttpRequest"},
+                )
+                link_info = self._post(ajax_url, post_data, headers=ajax_headers)
                 if not link_info:
                     return FileDetail(LanZouCloud.NETWORK_ERROR, name=f_name, time=f_time, size=f_size, desc=f_desc,
                                       pwd=pwd, url=share_url)
@@ -691,7 +824,11 @@ class LanZouCloud(object):
             return self._set_dir_info(fid, info.name, desc)
 
     def rename_file(self, file_id, filename):
-        """允许会员重命名文件(无法修后缀名)"""
+        """允许会员重命名文件(无法修后缀名)。
+
+        当前真实行为依赖蓝奏云账号权限。非会员账号会被服务端直接拒绝，
+        常见返回信息为“此功能仅会员使用，请先开通会员”，此时本函数返回 FAILED。
+        """
         post_data = {'task': 46, 'file_id': file_id, 'file_name': name_format(filename), 'type': 2}
         result = self._post(self._doupload_url, post_data)
         if not result:
@@ -727,7 +864,10 @@ class LanZouCloud(object):
         id_list = [int(folder['folder_id']) for folder in resp.json()['info']]
         task_list = [ex.submit(self.get_full_path, fid) for fid in id_list]
         for task in as_completed(task_list):
-            result.append(task.result())
+            try:
+                result.append(task.result())
+            except Exception as exc:
+                logger.debug(f"Get full path failed: {exc}")
         return sorted(result)
 
     def move_file(self, file_id, folder_id=-1) -> int:
@@ -1051,13 +1191,16 @@ class LanZouCloud(object):
 
         with open(tmp_file_path, "ab") as f:
             file_name = os.path.basename(file_path)
-            for chunk in resp.iter_content(4096):
-                if chunk:
-                    f.write(chunk)
-                    f.flush()
-                    now_size += len(chunk)
-                    if callback is not None:
-                        callback(file_name, int(content_length), now_size)
+            success, now_size = self._stream_download(
+                info.durl,
+                f,
+                start_byte=now_size,
+                callback=callback,
+                total_size=int(content_length),
+                file_name=file_name,
+            )
+            if not success:
+                return LanZouCloud.FAILED
 
         # 文件下载完成后, 检查文件尾部 512 字节数据
         # 绕过官方限制上传时, API 会隐藏文件真实信息到文件尾部
@@ -1116,8 +1259,11 @@ class LanZouCloud(object):
         if is_file_url(share_url):
             return FolderDetail(LanZouCloud.URL_INVALID)
         try:
-            html = self._get(share_url, headers=self._headers).text
+            response = self._get(share_url, headers=self._headers, allow_acw_retry=True)
+            html = response.text
         except requests.RequestException:
+            return FolderDetail(LanZouCloud.NETWORK_ERROR)
+        if not response:
             return FolderDetail(LanZouCloud.NETWORK_ERROR)
         if '文件不存在' in html or '文件取消' in html:
             return FolderDetail(LanZouCloud.FILE_CANCELLED)
@@ -1125,31 +1271,16 @@ class LanZouCloud(object):
         if ('id="pwdload"' in html or 'id="passwddiv"' in html) and len(dir_pwd) == 0:
             return FolderDetail(LanZouCloud.LACK_PASSWORD)
 
-        if "acw_sc__v2" in html:
-            # 在页面被过多访问或其他情况下，有时候会先返回一个加密的页面，其执行计算出一个acw_sc__v2后放入页面后再重新访问页面才能获得正常页面
-            # 若该页面进行了js加密，则进行解密，计算acw_sc__v2，并加入cookie
-            acw_sc__v2 = calc_acw_sc__v2(html)
-            self._session.cookies.set("acw_sc__v2", acw_sc__v2)
-            logger.debug(f"Set Cookie: acw_sc__v2={acw_sc__v2}")
-            html = self._get(share_url).text  # 文件分享页面(第一页)
-
         try:
-            # 获取文件需要的参数
-            html = remove_notes(html)
-            lx = re.findall(r"'lx':'?(\d)'?,", html)[0]
-            t = re.findall(r"var [0-9a-z]{6} = '(\d{10})';", html)[0]
-            k = re.findall(r"var [0-9a-z]{6} = '([0-9a-z]{15,})';", html)[0]
-            # 文件夹的信息
-            folder_id = re.findall(r"'fid':'?(\d+)'?,", html)[0]
-            folder_name = re.findall(r"var.+?='(.+?)';\n.+document.title", html) or \
-                          re.findall(r'<div class="user-title">(.+?)</div>', html)
-            folder_name = folder_name[0]
-
-            folder_time = re.findall(r'class="rets">([\d\-]+?)<a', html)  # ['%m-%d'] 或者 None (vip自定义)
-            folder_time = folder_time[0] if folder_time else datetime.today().strftime("%m-%d")  # 没有就设为现在
-            folder_desc = re.findall(r'id="filename">(.+?)</span>', html) or \
-                          re.findall(r'<div class="user-radio-\d"></div>(.+?)</div>', html)
-            folder_desc = folder_desc[0] if folder_desc else ""
+            page_context = parse_folder_page_context(html, share_url, response.url)
+            html = page_context["html"]
+            lx = page_context["lx"]
+            t = page_context["t"]
+            k = page_context["k"]
+            folder_id = page_context["folder_id"]
+            folder_name = page_context["folder_name"]
+            folder_time = page_context["folder_time"] or datetime.today().strftime("%m-%d")
+            folder_desc = page_context["folder_desc"]
         except IndexError:
             return FolderDetail(LanZouCloud.FAILED)
 
@@ -1159,7 +1290,7 @@ class LanZouCloud(object):
         all_sub_folders = re.findall(
             r'mbxfolder"><a href="(.+?)".+class="filename">(.+?)<div class="filesize">(.*?)</div>', html)
         for url, name, desc in all_sub_folders:
-            url = self._host_url + url
+            url = join_share_url(page_context["origin"] + "/", url.lstrip('/'))
             time_str = datetime.today().strftime('%Y-%m-%d')  # 网页没有时间信息, 设置为今天
             sub_folders.append(FolderInfo(name=name, desc=desc, url=url, time=time_str, pwd=dir_pwd))
 
@@ -1172,7 +1303,16 @@ class LanZouCloud(object):
             try:
                 logger.debug(f"Parse page {page}...")
                 post_data = {'lx': lx, 'pg': page, 'k': k, 't': t, 'fid': folder_id, 'pwd': dir_pwd}
-                resp = self._post(self._host_url + '/filemoreajax.php', data=post_data, headers=self._headers).json()
+                for key in ("uid", "rep", "up", "ls"):
+                    if page_context.get(key):
+                        post_data[key] = page_context[key]
+                ajax_headers = build_browser_headers(
+                    self._headers,
+                    referer=page_context["referer"],
+                    origin=page_context["origin"],
+                    extra={"X-Requested-With": "XMLHttpRequest"},
+                )
+                resp = self._post(page_context["ajax_url"], data=post_data, headers=ajax_headers).json()
             except (requests.RequestException, AttributeError):
                 return FolderDetail(LanZouCloud.NETWORK_ERROR)
             if resp['zt'] == 1:  # 成功获取一页文件信息
@@ -1182,7 +1322,7 @@ class LanZouCloud(object):
                         time=time_format(f["time"]),  # 上传时间
                         size=f["size"],  # 文件大小
                         type=f["name_all"].split('.')[-1],  # 文件格式
-                        url=self._host_url + "/" + f["id"]  # 文件分享链接
+                        url=join_share_url(page_context["origin"] + "/", f["id"])  # 文件分享链接
                     ))
                 page += 1  # 下一页
                 continue
@@ -1254,12 +1394,18 @@ class LanZouCloud(object):
                 record_file = big_file + '.record'
 
         if not os.path.exists(record_file):  # 初始化记录文件
-            info = {'last_ending': 0, 'finished': []}  # 记录上一个数据块结尾地址和已经下载的数据块
+            info = {'last_ending': 0, 'finished': [], 'part_name': None, 'part_offset': 0}
             with open(record_file, 'wb') as rf:
                 pickle.dump(info, rf, protocol=4)
         else:  # 读取记录文件，下载续传
             with open(record_file, 'rb') as rf:
                 info = pickle.load(rf)
+                info.setdefault('last_ending', 0)
+                info.setdefault('finished', [])
+                info.setdefault('part_name', None)
+                if 'part_offset' not in info:
+                    current_size = os.path.getsize(big_file) if os.path.exists(big_file) else info['last_ending']
+                    info['part_offset'] = max(current_size - info['last_ending'], 0)
                 file_list = [f for f in file_list if f.name not in info['finished']]  # 排除已下载的数据块
                 logger.debug(f"Find download record file: {info}")
 
@@ -1273,35 +1419,42 @@ class LanZouCloud(object):
                 if durl_info.code != LanZouCloud.SUCCESS:
                     logger.debug(f"Can't get direct url: {file}")
                     return durl_info.code
-                # 准备向大文件写入数据
-                file_size_now = os.path.getsize(big_file)
-                down_start_byte = file_size_now - info['last_ending']  # 当前数据块上次下载中断的位置
-                headers = {**self._headers, 'Range': 'bytes=%d-' % down_start_byte}
+                part_base = info['last_ending']
+                if info['part_name'] not in (None, file.name):
+                    info['part_name'] = None
+                    info['part_offset'] = 0
+                if info['part_name'] is None:
+                    info['part_name'] = file.name
+                down_start_byte = info['part_offset'] if info['part_name'] == file.name else 0
                 logger.debug(f"Download {file.name}, Range: {down_start_byte}-")
-                resp = self._get(durl_info.durl, stream=True, headers=headers)
 
-                if resp is None:  # 网络错误, 没有响应数据
-                    return LanZouCloud.FAILED
-                if resp.status_code == 416:  # 下载完成后重复下载导致 Range 越界, 服务器返回 416
-                    logger.debug(f"File {file_name} has already downloaded.")
-                    os.remove(record_file)  # 删除记录文件
-                    return LanZouCloud.SUCCESS
+                def _part_callback(_, __, part_downloaded):
+                    if callback:
+                        callback(file_name, total_size, part_base + part_downloaded)
 
-                try:
-                    for chunk in resp.iter_content(4096):
-                        if chunk:
-                            file_size_now += len(chunk)
-                            bf.write(chunk)
-                            bf.flush()  # 确保缓冲区立即写入文件，否则下一次写入时获取的文件大小会有偏差
-                            if callback:
-                                callback(file_name, total_size, file_size_now)
-                    # 一块数据写入完成，更新记录文件
-                    info['finished'].append(file.name)
-                finally:
-                    info['last_ending'] = file_size_now
+                success, part_downloaded = self._stream_download(
+                    durl_info.durl,
+                    bf,
+                    start_byte=down_start_byte,
+                    callback=_part_callback,
+                    total_size=total_size,
+                    file_name=file_name,
+                )
+                if not success:
+                    info['part_name'] = file.name
+                    info['part_offset'] = part_downloaded
                     with open(record_file, 'wb') as rf:
                         pickle.dump(info, rf, protocol=4)
                     logger.debug(f"Update download record info: {info}")
+                    return LanZouCloud.FAILED
+
+                info['finished'].append(file.name)
+                info['last_ending'] = part_base + part_downloaded
+                info['part_name'] = None
+                info['part_offset'] = 0
+                with open(record_file, 'wb') as rf:
+                    pickle.dump(info, rf, protocol=4)
+                logger.debug(f"Update download record info: {info}")
             # 全部数据块下载完成, 记录文件可以删除
             logger.debug(f"Delete download record file: {record_file}")
             os.remove(record_file)
