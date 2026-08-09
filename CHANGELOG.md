@@ -1,5 +1,11 @@
 # Changelog
 
+## `v2.6.12` - `2026-08-09`
+
+- 修复下载直链解析遇到 CDN `acw_sc__v2` JS 反爬挑战时抛出 `KeyError: 'location'`、所有文件下载失败的问题：`get_file_info_by_url()` 请求假直链（`fake_url`）时启用 `allow_acw_retry=True`，自动计算 `acw_sc__v2` cookie 后重试
+- 增强 `_should_retry_with_acw()` 挑战识别：同时匹配 `acw_sc__v2` 变量与 `arg1='...'` 特征，避免 CDN 变更挑战页面结构后检测失效
+- 实测 `wwbln.lanzouw.com` / `wwbfe.lanzouq.com` 等域名下的分享文件下载均可稳定通过挑战
+
 ## `v2.6.11` - `2026-05-07`
 
 - 重建当前蓝奏网页登录流程，恢复 `login(username, password)`，并保留 `login_by_cookie(cookie)` 作为稳定登录路径

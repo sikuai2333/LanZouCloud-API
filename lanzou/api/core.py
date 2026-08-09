@@ -672,7 +672,7 @@ class LanZouCloud(object):
                               url=share_url)
 
         fake_url = link_info['dom'] + '/file/' + link_info['url']  # 假直连，存在流量异常检测
-        download_page = self._get(fake_url, allow_redirects=False)
+        download_page = self._get(fake_url, allow_redirects=False, allow_acw_retry=True)
         if not download_page:
             return FileDetail(LanZouCloud.NETWORK_ERROR, name=f_name, time=f_time, size=f_size, desc=f_desc,
                               pwd=pwd, url=share_url)

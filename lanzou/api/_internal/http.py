@@ -65,7 +65,8 @@ class LanZouHTTPClient(object):
         content_type = response.headers.get("content-type", "")
         if "html" not in content_type and "text" not in content_type:
             return False
-        return "acw_sc__v2" in response.text
+        text = response.text
+        return "acw_sc__v2" in text or "arg1='" in text
 
     def request(self, method, url, data=None, **kwargs):
         allow_acw_retry = kwargs.pop("allow_acw_retry", False)
